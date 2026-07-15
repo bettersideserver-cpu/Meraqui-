@@ -1562,7 +1562,11 @@
     /* A phone reporting DPR 3 does not want 3× the fragments of this scene.
        1.25 keeps the marble crisp; the watchdog below drops to 1.0 if the
        frame budget says so. */
-    let dprCap = CFG.touch ? 1.25 : 2;
+    /* The composer means renderer antialias does nothing (the chain renders to
+       plain RTs), so pixel ratio is the only quality/cost dial there is — and
+       on a phone it's the cheapest one to turn. 1.0 native is plenty at this
+       density for a scene made of fog and soft marble. */
+    let dprCap = CFG.touch ? 1 : 2;
     renderer.setPixelRatio(Math.min(devicePixelRatio, dprCap));
     renderer.setSize(innerWidth, innerHeight);
     renderer.setClearColor(0x000000, 0);
@@ -1630,26 +1634,46 @@
       return m;
     }
 
-    /* ---------- accent rig per statue: sun does the work, these sculpt ---------- */
+    /* ---------- accent rig per statue: sun does the work, these sculpt ----------
+
+       THE thing that made this heavy on a phone. Four gods x four lights = 13
+       spots and 4 points living in the scene permanently. A light at
+       intensity 0 is not a light that costs nothing: three.js compiles the
+       count into every material, so EVERY fragment on screen — all 400m of
+       floor, all 9m of every pillar, in a scene built out of overdraw — was
+       running 17 light evaluations to render three lights that were actually
+       on. That is the whole frame budget, spent on arithmetic that multiplies
+       by zero.
+
+       The phone gets key + rim only: 8 spots, no points, and the light loop
+       every fragment walks is less than half as long. The fill and pool are
+       modelling niceties you cannot see at 390px, so the key takes up their
+       slack. Desktop keeps all four. */
     function studioRig(target, z) {
       const g = new THREE.Group();
+      const rig = [];
+
       const key = new THREE.SpotLight(0xFFE0B8, 0, 30, Math.PI / 5.2, 0.55, 1.6);
       key.position.set(-4.2, 7.5, z + 5.2);
-      const fill = new THREE.PointLight(0xBFD0E2, 0, 22, 1.8);
-      fill.position.set(3.6, 2.4, z + 4.2);
+      rig.push([key, CFG.low ? 205 : 170]);          // carries fill's job on low
+
       const rim = new THREE.SpotLight(0xFFF4E0, 0, 28, Math.PI / 5.5, 0.5, 1.4);
       rim.position.set(1.6, 6.8, z - 4.8);
-      const pool = new THREE.SpotLight(0xFFEFD2, 0, 24, Math.PI / 6.5, 0.7, 1.7);
-      pool.position.set(0, 9.5, z);
-      [key, fill, rim, pool].forEach(l => { g.add(l); if (l.target) { l.target.position.copy(target); g.add(l.target); } });
+      rig.push([rim, 230]);
+
+      if (!CFG.low) {
+        const fill = new THREE.PointLight(0xBFD0E2, 0, 22, 1.8);
+        fill.position.set(3.6, 2.4, z + 4.2);
+        rig.push([fill, 16]);
+        const pool = new THREE.SpotLight(0xFFEFD2, 0, 24, Math.PI / 6.5, 0.7, 1.7);
+        pool.position.set(0, 9.5, z);
+        rig.push([pool, 70]);
+      }
+
+      rig.forEach(([l]) => { g.add(l); if (l.target) { l.target.position.copy(target); g.add(l.target); } });
       scene.add(g);
       return {
-        set(v) {
-          key.intensity = 170 * v;
-          fill.intensity = 16 * v;
-          rim.intensity = 230 * v;
-          pool.intensity = 70 * v;
-        }
+        set(v) { for (let i = 0; i < rig.length; i++) rig[i][0].intensity = rig[i][1] * v; }
       };
     }
 
@@ -1685,13 +1709,18 @@
     /* =========================================================
        MATERIAL TREATMENT
     ========================================================= */
-    /* gold areas are flagged metallic in the texture maps — make only them radiate */
-    function goldGlow(mat, strength = 0.5) {
+    /* Gold areas are flagged metallic in the texture maps — make only them
+       radiate. The strength comes in as a uniform object rather than a number
+       so it stays live: this is the one value on the page most likely to need
+       nudging against the real textures, and recompiling a shader to find out
+       is no way to light a colonnade. */
+    const pillarGlowU = { value: 0.14 };
+    function goldGlow(mat, uni) {
       const prev = mat.onBeforeCompile;
       mat.onBeforeCompile = sh => {
         if (prev) prev(sh);
         sh.uniforms.uT = uTime;
-        sh.uniforms.uGlow = { value: strength };
+        sh.uniforms.uGlow = uni;
         sh.fragmentShader = 'uniform float uT; uniform float uGlow;\n' + sh.fragmentShader;
         sh.fragmentShader = sh.fragmentShader.replace('#include <emissivemap_fragment>', `
       #include <emissivemap_fragment>
@@ -2122,6 +2151,9 @@
        WORLD
     ========================================================= */
     const gods = [];
+    /* how lit the brightest god currently is, and whether the scene graph has
+       changed since the bloom pass last cached its mesh list */
+    let glowLevel = 0, bloomListDirty = true;
     const Z = { hestia: -CFG.hallGap, heph: -CFG.hallGap * 2, athena: -CFG.hallGap * 3, apollo: -CFG.hallGap * 4 };
 
     function placeGod(id, name, z, mode, targetH = CFG.godHeight, pedestal = false) {
@@ -2158,6 +2190,7 @@
       group.add(proxy);
       const rig = studioRig(new THREE.Vector3(0, y0 + targetH * 0.55, z), z);
       gods.push({ group, rig, z, name, mode, fx, spin: { y: 0, vy: 0 }, brk: { target: 0, val: 0, us: breakUs }, proxy, tapOff: false });
+      bloomListDirty = true;
     }
 
     /* =========================================================
@@ -2221,6 +2254,7 @@
       }, undefined, () => { /* asset absent — keep CSS photo, no hero liquid */ });
     }
 
+    let pillarMat = null;
     function placeColonnade() {
       let src = null;
       loaded.pillar.scene.traverse(o => { if (o.isMesh && !src) src = o; });
@@ -2232,13 +2266,23 @@
       const cx = geo.boundingBox.getCenter(new THREE.Vector3());
       geo.translate(-cx.x, -geo.boundingBox.min.y, -cx.z);
       const mat = src.material;
-      mat.envMapIntensity = 0.4;
-      mat.roughness = Math.min(mat.roughness ?? 1, 0.9);
-      goldGlow(mat, 0.45);
+      /* The colonnade was blowing out: 0.45 of emissive on every metallic
+         texel, on 9m columns that fill the frame, on top of a 0.4 env bounce
+         — the pillars were out-shouting the gods they're meant to frame.
+         Emissive is now a third of that (less again on a phone, where they're
+         also the biggest source of overdraw), the env bounce is roughly half,
+         and the base tint comes down so they sit back into the fog. */
+      pillarGlowU.value = CFG.low ? 0.06 : 0.14;
+      mat.envMapIntensity = 0.22;
+      mat.roughness = Math.min(mat.roughness ?? 1, 0.95);
+      if (mat.color) mat.color.multiplyScalar(0.84);
+      goldGlow(mat, pillarGlowU);
+      pillarMat = mat;
       const spots = [];
       /* the far end of the colonnade is fog on any screen; a phone doesn't
-         need to pay for the last four rows it will never resolve */
-      const zEnd = CFG.low ? -84 : -96;
+         need to pay for rows it will never resolve — and every pillar it does
+         draw is 9m of full-screen overdraw, which is what actually costs */
+      const zEnd = CFG.low ? -70 : -96;
       for (let z = 8; z >= zEnd; z -= 7.4) for (const x of [-5.4, 5.4]) spots.push([x, z]);
       const inst = new THREE.InstancedMesh(geo, mat, spots.length);
       const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), up = new THREE.Vector3(0, 1, 0);
@@ -2249,11 +2293,12 @@
       });
       inst.instanceMatrix.needsUpdate = true;
       scene.add(inst);
+      bloomListDirty = true;
     }
 
     /* ---------- drifting motes catching the sun ---------- */
     {
-      const N = CFG.low ? 190 : 420, pos = new Float32Array(N * 3), seed = new Float32Array(N);
+      const N = CFG.low ? 120 : 420, pos = new Float32Array(N * 3), seed = new Float32Array(N);
       for (let i = 0; i < N; i++) {
         pos[i * 3] = (Math.random() - 0.5) * 10;
         pos[i * 3 + 1] = Math.random() * 6 + 0.2;
@@ -2484,6 +2529,13 @@
       dof: { enabled: !LOW, autoFocus: false, focus: 10, aperture: 1.0, maxblur: 0.01 },
       camera: { fov: BASE_FOV, exposure: 0.4 },
       heroExposure: 1,
+      /* MERAQUI_FX.pillar.glow = 0.2  /  .env = 0.3  — live, no reload */
+      pillar: {
+        get glow() { return pillarGlowU.value; },
+        set glow(v) { pillarGlowU.value = v; },
+        get env() { return pillarMat ? pillarMat.envMapIntensity : 0; },
+        set env(v) { if (pillarMat) pillarMat.envMapIntensity = v; }
+      },
       background: 0xE6DECE        // the hall colour behind the marble
     };
     const bgColor = new THREE.Color(FX.background);
@@ -2783,19 +2835,20 @@
       const bloomLayer = new THREE.Layers();
       bloomLayer.set(11);
       const darkMat = new THREE.MeshBasicMaterial({ color: 0x000000 });
-      const matStash = {};
-      function darkenNonBloom(obj) {
-        if (obj.isMesh && !bloomLayer.test(obj.layers)) {
-          matStash[obj.uuid] = obj.material;
-          obj.material = darkMat;
-        }
-      }
-      function restoreMat(obj) {
-        if (matStash[obj.uuid]) { obj.material = matStash[obj.uuid]; delete matStash[obj.uuid]; }
+      /* The old version traversed the entire scene twice a frame and built a
+         fresh uuid-keyed object each time — a full graph walk plus garbage,
+         60 times a second, to swap materials on a set that only changes when
+         a god is raised. Cached, and rebuilt only when the graph says so. */
+      let nonBloom = null;
+      const stash = [];
+      function nonBloomList(sc) {
+        const list = [];
+        sc.traverse(o => { if (o.isMesh && !bloomLayer.test(o.layers)) list.push(o); });
+        return list;
       }
       /* half resolution on a phone: the glow is a wide blur, so nobody can
          see the difference, and it costs a quarter of the fragments */
-      const bloomScale = LOW ? 0.5 : 1;
+      const bloomScale = LOW ? 0.4 : 1;
       const bloomComposer = new EffectComposer(renderer);
       bloomComposer.renderToScreen = false;
       bloomComposer.addPass(new RenderPass(scene, camera));
@@ -2902,15 +2955,22 @@
             renderer.setRenderTarget(null);
           }
 
-          // selective bloom: darken everything except statues, bloom, restore
-          const doGlow = FX.selectiveBloom && activeScene === scene;
+          /* Selective bloom: darken everything except the statues, bloom that,
+             add it back. It costs a second render of the whole scene — so it
+             only runs when a god is actually lit. Nothing glows between
+             chapters, and nothing glows on the hero, so most of a scroll now
+             skips this entirely instead of re-rendering the hall to bloom a
+             black frame. */
+          const doGlow = FX.selectiveBloom && activeScene === scene && glowLevel > 0.03;
           if (doGlow) {
-            activeScene.traverse(darkenNonBloom);
+            if (bloomListDirty || !nonBloom) { nonBloom = nonBloomList(activeScene); bloomListDirty = false; }
+            stash.length = 0;
+            for (let i = 0; i < nonBloom.length; i++) { stash.push(nonBloom[i].material); nonBloom[i].material = darkMat; }
             const prevBg = activeScene.background;
             activeScene.background = null;
             bloomComposer.render();
             activeScene.background = prevBg;
-            activeScene.traverse(restoreMat);
+            for (let i = 0; i < nonBloom.length; i++) nonBloom[i].material = stash[i];
             combinePass.uniforms.tGlow.value = bloomComposer.renderTarget2.texture;
           }
           combinePass.enabled = doGlow;
@@ -2934,6 +2994,7 @@
        drop to 1.0× once and stay there. Measured over 2s windows so a
        single hitch (a god's shader compiling) can't trigger it.
     ========================================================= */
+    let dustTick = 0;
     let fpsAcc = 0, fpsFrames = 0, dprDropped = false;
     function watchdog(dt) {
       if (dprDropped || !CFG.touch) return;
@@ -2941,10 +3002,10 @@
       if (fpsAcc < 2) return;
       const fps = fpsFrames / fpsAcc;
       fpsAcc = 0; fpsFrames = 0;
-      if (fps < 38) {
+      if (fps < 40) {
         dprDropped = true;
-        dprCap = 1;
-        renderer.setPixelRatio(1);
+        dprCap = 0.8;
+        renderer.setPixelRatio(Math.min(devicePixelRatio, dprCap));
         renderer.setSize(innerWidth, innerHeight);
         if (PostFX.ok) PostFX.onResize();
       }
@@ -3013,6 +3074,7 @@
         }
       }
 
+      let lit = 0;
       gods.forEach((g, i) => {
         const v = win(smoothT, WINDOWS[i].a - 0.02, WINDOWS[i].b + 0.02, 0.06);
         g.rig.set(v);
@@ -3027,15 +3089,20 @@
           g.brk.us.forEach(u => u.value = g.brk.val);
         }
         if (g.fx) g.fx.update(dt, g.brk.val);
+        if (g.brk.val > lit) lit = g.brk.val;
       });
+      glowLevel = lit;
 
-      /* dust drift */
-      if (window.__dust) {
+      /* dust drift — a JS loop plus a buffer upload every frame. On a phone
+         it runs on every third frame at triple the step: the motes travel at
+         exactly the same speed, and two of every three uploads disappear. */
+      const dustStep = CFG.low ? 3 : 1;
+      if (window.__dust && (dustTick++ % dustStep === 0)) {
         const p = window.__dust.geometry.attributes.position, sd = window.__dust.userData.seed;
         const tt = now * 0.00012;
         for (let i = 0; i < sd.length; i++) {
-          p.array[i * 3] += Math.sin(tt * 7 + sd[i]) * 0.0012;
-          p.array[i * 3 + 1] += Math.cos(tt * 5 + sd[i] * 1.7) * 0.0009;
+          p.array[i * 3] += Math.sin(tt * 7 + sd[i]) * 0.0012 * dustStep;
+          p.array[i * 3 + 1] += Math.cos(tt * 5 + sd[i] * 1.7) * 0.0009 * dustStep;
         }
         p.needsUpdate = true;
       }
